@@ -97,6 +97,41 @@ device_mode = st.sidebar.radio(
     help="Pilih sumber data vital signs dan ventilator",
 )
 
+# ── Auto-save (hanya relevan utk Auto Simulate & Real Device) ─────────────────
+# Manual Input TIDAK ditawari auto-save — input manual harus tetap sengaja
+# disimpan oleh user, supaya tidak ada data yang ke-submit tanpa disadari.
+auto_save_enabled  = False
+auto_save_interval = 30  # detik
+
+if device_mode in ("📊 Auto (Simulate)", "🔗 Real Device (HL7/DICOM)"):
+    st.sidebar.markdown("#### 💾 Auto-Save")
+    auto_save_enabled = st.sidebar.toggle(
+        "Simpan otomatis ke riwayat",
+        value=True,
+        help=(
+            "Saat aktif, data vital signs & parameter ventilator otomatis "
+            "tersimpan ke riwayat secara berkala — tidak perlu klik tombol "
+            "💾 Save manual tiap kali. Data placeholder (HL7 belum kirim apa "
+            "pun / status \"_pending\") tidak ikut disimpan."
+        ),
+        key="auto_save_enabled_toggle",
+    )
+    if auto_save_enabled:
+        auto_save_interval = st.sidebar.slider(
+            "Interval simpan (detik):", min_value=5, max_value=300, value=30, step=5,
+            key="auto_save_interval_slider",
+        )
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=auto_save_interval * 1000, key="device_autosave_tick")
+        except ImportError:
+            st.sidebar.caption(
+                "ℹ️ Install `streamlit-autorefresh` (`pip install streamlit-autorefresh`) "
+                "agar halaman ini ikut me-refresh otomatis tiap interval di atas. Tanpa "
+                "paket itu, auto-save tetap berjalan setiap kali halaman direfresh "
+                "manual atau Anda berpindah tab/widget."
+            )
+
 # ── Inisialisasi connector (hanya dipakai saat Real Device mode) ──────────────
 connector: RealDeviceConnector | None = None
 
@@ -172,6 +207,30 @@ if device_mode == "🔗 Real Device (HL7/DICOM)":
         if st.sidebar.button("🏥 Ping PACS", key="btn_ping_pacs"):
             ok, msg = connector.ping_dicom()
             st.sidebar.success(msg) if ok else st.sidebar.error(msg)
+
+# ── Helper: auto-save dengan jeda minimal antar simpan ───────────────────────
+def _maybe_auto_save(state_key, enabled, interval_s, save_fn, source=None):
+    """
+    Simpan otomatis dengan jeda minimal `interval_s` detik antar simpan, supaya
+    tidak membanjiri database setiap kali script Streamlit di-rerun (mis. saat
+    pindah tab atau menggeser slider/widget lain).
+
+    Data placeholder/pending (source berakhiran "_pending" — artinya HL7 server
+    aktif tapi belum ada pesan device sungguhan) TIDAK ikut disimpan otomatis.
+
+    Return True jika baru saja menyimpan pada panggilan ini.
+    """
+    if not enabled:
+        return False
+    if source is not None and str(source).endswith("_pending"):
+        return False
+    now_ts  = time.time()
+    last_ts = st.session_state.get(state_key, 0)
+    if now_ts - last_ts >= interval_s:
+        save_fn()
+        st.session_state[state_key] = now_ts
+        return True
+    return False
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("MONITORING ALAT-ALAT MEDIS")
@@ -322,9 +381,33 @@ with tab1:
     display_vital_card(col5, "RR",   vs.respiratory_rate, "/min", 12, 20)
     display_vital_card(col6, "Temp", vs.body_temp,        "°C",   36.5, 37.5)
 
-    if st.button("💾 Save Vital Signs", key="save_vitals"):
-        save_vital_signs(patient_id, vs)
-        st.success(f"✓ Vital signs saved at {vs.timestamp}")
+    col_save1, col_save2 = st.columns([1, 3])
+    with col_save1:
+        if st.button("💾 Save Vital Signs", key="save_vitals"):
+            save_vital_signs(patient_id, vs)
+            st.success(f"✓ Vital signs saved at {vs.timestamp}")
+
+    # ── Auto-save (mode Auto Simulate / Real Device) ─────────────────────────
+    with col_save2:
+        if device_mode != "🔄 Manual Input":
+            _vs_src = getattr(vs, "source", None)
+            just_saved = _maybe_auto_save(
+                f"_autosave_vitals_ts_{patient_id}",
+                auto_save_enabled, auto_save_interval,
+                lambda: save_vital_signs(patient_id, vs),
+                source=_vs_src,
+            )
+            if just_saved:
+                st.toast(f"💾 Auto-save: vital signs tersimpan ({vs.timestamp})", icon="💾")
+                st.caption(f"💾 Auto-save aktif (setiap {auto_save_interval}s) — baru tersimpan otomatis.")
+            elif auto_save_enabled and _vs_src and str(_vs_src).endswith("_pending"):
+                st.caption("⏳ Auto-save menunggu data live — placeholder tidak ikut disimpan.")
+            elif auto_save_enabled:
+                _last = st.session_state.get(f"_autosave_vitals_ts_{patient_id}")
+                _ago  = f"{int(time.time() - _last)}s lalu" if _last else "—"
+                st.caption(f"💾 Auto-save aktif (setiap {auto_save_interval}s) — tersimpan terakhir: {_ago}.")
+            else:
+                st.caption("⚪ Auto-save nonaktif — aktifkan di sidebar bila perlu.")
 
     alerts = check_vital_alerts(patient_id, vs)
     if alerts:
@@ -431,9 +514,33 @@ with tab2:
                 delta="⚠️ HIGH" if vp.peak_pressure > 25 else "✓ Normal",
             )
 
-        if st.button("💾 Save Ventilator Params", key="save_vent"):
-            save_ventilator_params(patient_id, vp)
-            st.success(f"✓ Ventilator params saved at {vp.timestamp}")
+        col_vsave1, col_vsave2 = st.columns([1, 3])
+        with col_vsave1:
+            if st.button("💾 Save Ventilator Params", key="save_vent"):
+                save_ventilator_params(patient_id, vp)
+                st.success(f"✓ Ventilator params saved at {vp.timestamp}")
+
+        # ── Auto-save (mode Auto Simulate / Real Device) ─────────────────────
+        with col_vsave2:
+            if device_mode != "🔄 Manual Input":
+                _vp_src = getattr(vp, "source", None)
+                just_saved_v = _maybe_auto_save(
+                    f"_autosave_vent_ts_{patient_id}",
+                    auto_save_enabled, auto_save_interval,
+                    lambda: save_ventilator_params(patient_id, vp),
+                    source=_vp_src,
+                )
+                if just_saved_v:
+                    st.toast(f"💾 Auto-save: parameter ventilator tersimpan ({vp.timestamp})", icon="💾")
+                    st.caption(f"💾 Auto-save aktif (setiap {auto_save_interval}s) — baru tersimpan otomatis.")
+                elif auto_save_enabled and _vp_src and str(_vp_src).endswith("_pending"):
+                    st.caption("⏳ Auto-save menunggu data live — placeholder tidak ikut disimpan.")
+                elif auto_save_enabled:
+                    _last_v = st.session_state.get(f"_autosave_vent_ts_{patient_id}")
+                    _ago_v  = f"{int(time.time() - _last_v)}s lalu" if _last_v else "—"
+                    st.caption(f"💾 Auto-save aktif (setiap {auto_save_interval}s) — tersimpan terakhir: {_ago_v}.")
+                else:
+                    st.caption("⚪ Auto-save nonaktif — aktifkan di sidebar bila perlu.")
 
         vent_alerts = check_ventilator_alerts(patient_id, vp)
         if vent_alerts:
@@ -578,23 +685,89 @@ def _calc_map_fs(sbp, dbp):
     except Exception:
         return None
 
+# ── Opsi granularitas flowsheet (kolom waktu disejajarkan ke batas genap) ────
+_FS_GRANULARITY = {
+    "Per 1 Jam":    "1h",
+    "Per 30 Menit": "30min",
+    "Per 15 Menit": "15min",
+    "Per 10 Menit": "10min",
+    "Per 5 Menit":  "5min",
+    "Per 1 Menit":  "1min",
+}
+
+def _build_flowsheet_slots(df, freq_str, n_cols=6, cols=None, anchor=None):
+    """
+    Susun data ke dalam slot waktu yang disejajarkan ke batas genap sesuai
+    granularitas (mis. per jam -> 13:00, 14:00, 15:00, ...; per 15 menit
+    -> 13:00, 13:15, 13:30, ...). Mengembalikan n_cols slot TERBARU saja.
+
+    Kolom TERAKHIR selalu mengikuti waktu sekarang (real-time) yang dibulatkan
+    ke bawah sesuai granularitas — bukan timestamp pembacaan terakhir. Jadi
+    kalau sekarang jam 10:48 dan granularitas "Per 1 Menit", kolom terakhir
+    adalah 10:48; kalau "Per 1 Jam", kolom terakhir adalah 10:00.
+
+    Slot tanpa pembacaan akan tetap tampil dengan nilai kosong (—), supaya
+    jeda monitoring ikut terlihat — bukan sekadar 6 baris data mentah terakhir
+    yang waktunya bisa acak/duplikat.
+
+    cols:   daftar nama kolom yang diisi nilainya. Default ke kolom vital signs
+            (_FS_PARAMS); dipakai juga untuk flowsheet ventilator dengan cols lain.
+    anchor: timestamp acuan "sekarang". Default pd.Timestamp.now() — bisa dioper
+            dari luar supaya tabel vital sign & ventilator memakai acuan yang
+            sama persis dalam satu kali render.
+    """
+    if cols is None:
+        cols = [c[0] for c in _FS_PARAMS]
+    if anchor is None:
+        anchor = pd.Timestamp.now()
+
+    freq_td = pd.Timedelta(freq_str)
+
+    last_slot = anchor.floor(freq_str)                # bulatkan ke bawah ke batas genap
+    slot_starts = [last_slot - i * freq_td for i in range(n_cols - 1, -1, -1)]
+
+    records = []
+    for s in slot_starts:
+        window = df[(df["timestamp"] >= s) & (df["timestamp"] < s + freq_td)]
+        row = {}
+        for c in cols:
+            if c in window.columns:
+                non_null = window[c].dropna()
+                row[c] = non_null.iloc[-1] if len(non_null) else None
+            else:
+                row[c] = None
+        records.append(row)
+
+    return pd.DataFrame(records, index=pd.DatetimeIndex(slot_starts, name="timestamp"))
+
 with tab5:
     st.subheader("📋 Flowsheet Tanda Vital Terintegrasi")
     st.caption(
-        "Format **6 × 6** — 6 titik observasi terbaru × 8 parameter (termasuk MAP otomatis & CVP). "
-        "🟢 Normal · 🟡 Borderline · 🔴 Kritis"
+        "Format **6 × 6** — 6 slot waktu terbaru (disejajarkan ke batas genap) × 8 parameter "
+        "(termasuk MAP otomatis & CVP). 🟢 Normal · 🟡 Borderline · 🔴 Kritis"
     )
 
-    # ── Filter rentang waktu ──────────────────────────────────────────────────
-    fcol1, fcol2 = st.columns([3, 1])
+    # ── Filter rentang waktu & granularitas ──────────────────────────────────
+    fcol1, fcol2, fcol3 = st.columns([3, 2, 1])
     with fcol1:
         trend_hours = st.slider(
             "Rentang data (jam):", min_value=1, max_value=168, value=24,
             key="fs_trend_hours"
         )
     with fcol2:
+        granularity_label = st.selectbox(
+            "Interval kolom flowsheet:",
+            options=list(_FS_GRANULARITY.keys()),
+            index=0,  # default: Per 1 Jam
+            key="fs_granularity",
+        )
+    with fcol3:
+        st.write("")  # sejajarkan tombol dengan kontrol di atas
         if st.button("🔄 Refresh", key="fs_refresh", use_container_width=True):
             st.rerun()
+
+    fs_freq_str = _FS_GRANULARITY[granularity_label]
+    fs_anchor_now = pd.Timestamp.now()   # acuan "sekarang" bersama untuk semua flowsheet di tab ini
 
     vs_df = get_vital_signs_history(patient_id, hours=trend_hours)
 
@@ -612,8 +785,11 @@ with tab5:
             lambda r: _calc_map_fs(r.get("systolic_bp"), r.get("diastolic_bp")), axis=1
         )
 
-        # ── Ambil 6 titik terbaru untuk flowsheet ────────────────────────────
+        # ── Ambil 6 titik mentah terbaru (untuk kartu "Nilai Terbaru") ───────
         recent6 = vs_df.tail(6).reset_index(drop=True)
+
+        # ── Susun 6 slot waktu terbaru sesuai granularitas terpilih ──────────
+        slot_df = _build_flowsheet_slots(vs_df, fs_freq_str, n_cols=6, anchor=fs_anchor_now)
 
         # Info sumber
         if "source" in vs_df.columns:
@@ -625,10 +801,18 @@ with tab5:
         # ══════════════════════════════════════════════════════════════════════
         # TABEL FLOWSHEET
         # ══════════════════════════════════════════════════════════════════════
+        # Tampilkan tanggal di label jika 6 slot melewati lebih dari 1 hari
+        _slot_dates = {ts.date() for ts in slot_df.index}
+        _show_date = len(_slot_dates) > 1
+
         time_labels = []
-        for _, row in recent6.iterrows():
-            ts = row["timestamp"]
-            time_labels.append(ts.strftime("%H:%M") if pd.notna(ts) else "—")
+        for ts in slot_df.index:
+            if pd.isna(ts):
+                time_labels.append("—")
+            else:
+                time_labels.append(
+                    ts.strftime("%d/%m %H:%M") if _show_date else ts.strftime("%H:%M")
+                )
 
         # Build HTML table — baris = parameter, kolom = waktu
         header_cells = "".join(
@@ -636,16 +820,16 @@ with tab5:
             f"padding:7px 12px;font-size:12px;white-space:nowrap'>{t}</th>"
             for t in time_labels
         )
-        # Padding jika < 6 titik
+        # Padding jika < 6 slot
         empty_th = "".join(
             "<th style='background:#34495e;color:#888'></th>"
-            for _ in range(6 - len(recent6))
+            for _ in range(6 - len(slot_df))
         )
 
         rows_html = ""
         for (col_key, label, unit, *_) in _FS_PARAMS:
             cells_html = ""
-            for _, row in recent6.iterrows():
+            for _, row in slot_df.iterrows():
                 val = row.get(col_key)
                 if val is None or (hasattr(val, "__class__") and str(val) == "nan"):
                     cells_html += (
@@ -670,7 +854,7 @@ with tab5:
             # Padding kolom kosong
             cells_html += "".join(
                 "<td style='background:#f8f9fa'></td>"
-                for _ in range(6 - len(recent6))
+                for _ in range(6 - len(slot_df))
             )
             rows_html += (
                 f"<tr>"
@@ -701,6 +885,7 @@ with tab5:
 <p style="font-size:11px;color:#888;margin-top:4px">
   🟢 Normal &nbsp;·&nbsp; 🟡 Borderline &nbsp;·&nbsp; 🔴 Kritis
   &nbsp;|&nbsp; MAP = DBP + ⅓ × (SBP − DBP)
+  &nbsp;|&nbsp; Interval: <b>{granularity_label}</b> · sel "—" = belum ada pembacaan pada slot tersebut
 </p>"""
         st.markdown(table_html, unsafe_allow_html=True)
 
@@ -799,6 +984,7 @@ with tab5:
         if is_intubated:
             st.markdown("---")
             st.markdown("### 🫁 Flowsheet Parameter Ventilator")
+            st.caption(f"🕐 Interval kolom: **{granularity_label}** (mengikuti pengaturan di atas)")
 
             vent_df = get_ventilator_history(patient_id, hours=trend_hours)
             if vent_df.empty:
@@ -806,7 +992,6 @@ with tab5:
             else:
                 vent_df["timestamp"] = pd.to_datetime(vent_df["timestamp"])
                 vent_df = vent_df.sort_values("timestamp").reset_index(drop=True)
-                vent6   = vent_df.tail(6).reset_index(drop=True)
 
                 _VP = [
                     ("fio2",                "FiO₂",          "%",     0.21, 0.6,  "#e74c3c"),
@@ -817,9 +1002,17 @@ with tab5:
                     ("mean_airway_pressure","MAP Airway",     "cmH₂O", 8,    20,   "#9b59b6"),
                 ]
 
+                # ── Susun 6 slot waktu terbaru sesuai granularitas terpilih ──
+                vent_slot_df = _build_flowsheet_slots(
+                    vent_df, fs_freq_str, n_cols=6, cols=[v[0] for v in _VP], anchor=fs_anchor_now
+                )
+
+                _vent_slot_dates = {ts.date() for ts in vent_slot_df.index}
+                _vent_show_date  = len(_vent_slot_dates) > 1
                 _vent_time_labels = [
-                    r["timestamp"].strftime("%H:%M") if pd.notna(r["timestamp"]) else "—"
-                    for _, r in vent6.iterrows()
+                    (ts.strftime("%d/%m %H:%M") if _vent_show_date else ts.strftime("%H:%M"))
+                    if pd.notna(ts) else "—"
+                    for ts in vent_slot_df.index
                 ]
 
                 v_header = "".join(
@@ -829,36 +1022,41 @@ with tab5:
                 )
                 v_empty = "".join(
                     "<th style='background:#1f618d;color:#888'></th>"
-                    for _ in range(6 - len(vent6))
+                    for _ in range(6 - len(vent_slot_df))
                 )
 
                 v_rows = ""
                 for (vk, vl, vu, vn_lo, vn_hi, vc) in _VP:
                     vcells = ""
-                    for _, row in vent6.iterrows():
+                    for _, row in vent_slot_df.iterrows():
                         val = row.get(vk)
-                        try:
-                            vf = float(val)
-                            if vk == "fio2":
-                                vf = vf * 100 if vf <= 1.0 else vf
-                            disp = f"{vf:.0f}" if vk in ("tidal_volume","rate_set") else f"{vf:.1f}"
-                            lo = vn_lo * 100 if vk == "fio2" and vn_lo <= 1.0 else vn_lo
-                            hi = vn_hi * 100 if vk == "fio2" and vn_hi <= 1.0 else vn_hi
-                            if vf < lo or vf > hi:
-                                bg, tc = "#fff3cd", "#856404"
-                            else:
-                                bg, tc = "#d4edda", "#155724"
-                            if vk == "peak_pressure" and vf > 30:
-                                bg, tc = "#f8d7da", "#721c24"
-                        except Exception:
+                        if pd.isna(val):
+                            # slot kosong — float(nan) tidak melempar exception,
+                            # jadi harus dicek eksplisit supaya tidak tampil "nan"
                             bg, tc, disp = "#f8f9fa", "#aaa", "—"
+                        else:
+                            try:
+                                vf = float(val)
+                                if vk == "fio2":
+                                    vf = vf * 100 if vf <= 1.0 else vf
+                                disp = f"{vf:.0f}" if vk in ("tidal_volume","rate_set") else f"{vf:.1f}"
+                                lo = vn_lo * 100 if vk == "fio2" and vn_lo <= 1.0 else vn_lo
+                                hi = vn_hi * 100 if vk == "fio2" and vn_hi <= 1.0 else vn_hi
+                                if vf < lo or vf > hi:
+                                    bg, tc = "#fff3cd", "#856404"
+                                else:
+                                    bg, tc = "#d4edda", "#155724"
+                                if vk == "peak_pressure" and vf > 30:
+                                    bg, tc = "#f8d7da", "#721c24"
+                            except Exception:
+                                bg, tc, disp = "#f8f9fa", "#aaa", "—"
                         vcells += (
                             f"<td style='text-align:center;background:{bg};color:{tc};"
                             f"font-weight:600;padding:6px 8px;font-size:13px'>{disp}</td>"
                         )
                     vcells += "".join(
                         "<td style='background:#f8f9fa'></td>"
-                        for _ in range(6 - len(vent6))
+                        for _ in range(6 - len(vent_slot_df))
                     )
                     v_rows += (
                         f"<tr><td style='padding:6px 12px;font-weight:600;font-size:12px;"
@@ -881,7 +1079,10 @@ with tab5:
   </thead>
   <tbody>{v_rows}</tbody>
 </table>
-</div>"""
+</div>
+<p style="font-size:11px;color:#888;margin-top:4px">
+  Interval: <b>{granularity_label}</b> · sel "—" = belum ada pembacaan pada slot tersebut
+</p>"""
                 st.markdown(vent_table, unsafe_allow_html=True)
 
                 # Trend chart ventilator
