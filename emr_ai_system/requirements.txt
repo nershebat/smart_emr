@@ -4,12 +4,8 @@ pandas>=2.0
 numpy>=1.24
 plotly>=5.18
 requests>=2.31
-
-# ── Opsional (dashboard-3__1_.py tetap jalan tanpa ini — graceful degradation) ──
-# Voice-to-Text (S/O input via rekaman suara)
 SpeechRecognition>=3.10
 streamlit-mic-recorder>=0.0.4
-# Normalisasi/penerjemah transkrip suara via Claude API
 anthropic>=0.34
 pydicom
 langchain_chroma
