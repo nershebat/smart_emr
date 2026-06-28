@@ -544,96 +544,371 @@ with tab4:
             st.page_link("dashboard.py", label="⬅️ Buka Dashboard CPPT sekarang", icon="🫀")
 
 # =============================================================================
-# TAB 5 — Trend Analysis
+# TAB 5 — FLOWSHEET TANDA VITAL TERINTEGRASI (6 × 6)
 # =============================================================================
+
+# ── Konfigurasi parameter & batas normal ─────────────────────────────────────
+_FS_PARAMS = [
+    # (kolom_db,         label,            satuan,  normal_lo, normal_hi, alert_lo, alert_hi, warna_chart)
+    ("heart_rate",       "HR / Nadi",      "bpm",   60,  100,  50,  120,  "#e74c3c"),
+    ("systolic_bp",      "TD Sistolik",    "mmHg",  90,  140,  80,  160,  "#9b59b6"),
+    ("diastolic_bp",     "TD Diastolik",   "mmHg",  60,  90,   50,  100,  "#8e44ad"),
+    ("_map",             "MAP",            "mmHg",  70,  100,  65,  110,  "#2980b9"),
+    ("spo2",             "SpO₂",           "%",     95,  100,  90,  None, "#1abc9c"),
+    ("respiratory_rate", "RR",             "x/mnt", 12,  20,   8,   30,   "#27ae60"),
+    ("body_temp",        "Suhu",           "°C",    36.0,37.5, 35.5,38.5, "#f39c12"),
+    ("cvp",              "CVP",            "cmH₂O", 4,   12,   2,   18,   "#7f8c8d"),
+]
+
+def _fs_cell_bg(key, val):
+    """Warna background sel flowsheet: hijau/kuning/merah."""
+    cfg = next((r for r in _FS_PARAMS if r[0] == key), None)
+    if cfg is None or val is None:
+        return "#f8f9fa", "#6c757d"
+    _, _, _, n_lo, n_hi, a_lo, a_hi, _ = cfg
+    if (a_lo is not None and val < a_lo) or (a_hi is not None and val > a_hi):
+        return "#f8d7da", "#721c24"   # merah
+    if val < n_lo or val > n_hi:
+        return "#fff3cd", "#856404"   # kuning
+    return "#d4edda", "#155724"       # hijau
+
+def _calc_map_fs(sbp, dbp):
+    try:
+        return round(float(dbp) + (float(sbp) - float(dbp)) / 3, 1)
+    except Exception:
+        return None
+
 with tab5:
-    st.subheader("📈 Trend Analysis & Visualization")
-    trend_hours = st.slider("Tampilkan trend (jam):", min_value=1, max_value=168, value=24)
+    st.subheader("📋 Flowsheet Tanda Vital Terintegrasi")
+    st.caption(
+        "Format **6 × 6** — 6 titik observasi terbaru × 8 parameter (termasuk MAP otomatis & CVP). "
+        "🟢 Normal · 🟡 Borderline · 🔴 Kritis"
+    )
+
+    # ── Filter rentang waktu ──────────────────────────────────────────────────
+    fcol1, fcol2 = st.columns([3, 1])
+    with fcol1:
+        trend_hours = st.slider(
+            "Rentang data (jam):", min_value=1, max_value=168, value=24,
+            key="fs_trend_hours"
+        )
+    with fcol2:
+        if st.button("🔄 Refresh", key="fs_refresh", use_container_width=True):
+            st.rerun()
+
     vs_df = get_vital_signs_history(patient_id, hours=trend_hours)
 
-    if not vs_df.empty:
-        vs_df["timestamp"] = pd.to_datetime(vs_df["timestamp"])
-
-        # Label sumber data di chart
-        if "source" in vs_df.columns:
-            src_counts = vs_df["source"].value_counts().to_dict()
-            src_info = " | ".join(f"{k}: {v}" for k, v in src_counts.items())
-            st.caption(f"📊 Sumber data: {src_info}")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            fig1 = go.Figure()
-            fig1.add_trace(go.Scatter(
-                x=vs_df["timestamp"], y=vs_df["heart_rate"],
-                mode="lines+markers", name="Heart Rate", line=dict(color="red", width=2),
-            ))
-            fig1.add_hline(y=60, line_dash="dash", line_color="green", annotation_text="Min 60")
-            fig1.add_hline(y=100, line_dash="dash", line_color="green", annotation_text="Max 100")
-            fig1.update_layout(title="Heart Rate Trend", xaxis_title="Time",
-                                yaxis_title="HR (bpm)", height=400, hovermode="x unified")
-            st.plotly_chart(fig1, use_container_width=True)
-
-        with col2:
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(
-                x=vs_df["timestamp"], y=vs_df["spo2"],
-                mode="lines+markers", name="SpO2", line=dict(color="blue", width=2), fill="tozeroy",
-            ))
-            fig2.add_hline(y=90, line_dash="dash", line_color="red", annotation_text="Critical <90%")
-            fig2.update_layout(title="SpO2 Trend", xaxis_title="Time",
-                                yaxis_title="SpO2 (%)", height=400, hovermode="x unified")
-            st.plotly_chart(fig2, use_container_width=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            fig3 = go.Figure()
-            fig3.add_trace(go.Scatter(x=vs_df["timestamp"], y=vs_df["systolic_bp"],
-                                       mode="lines+markers", name="Static", line=dict(color="purple", width=2)))
-            fig3.add_trace(go.Scatter(x=vs_df["timestamp"], y=vs_df["diastolic_bp"],
-                                       mode="lines+markers", name="Diastolic", line=dict(color="orange", width=2)))
-            fig3.update_layout(title="Blood Pressure Trend", xaxis_title="Time",
-                                yaxis_title="BP (mmHg)", height=400, hovermode="x unified")
-            st.plotly_chart(fig3, use_container_width=True)
-
-        with col2:
-            fig4 = go.Figure()
-            fig4.add_trace(go.Scatter(x=vs_df["timestamp"], y=vs_df["body_temp"],
-                                       mode="lines+markers", name="Temperature",
-                                       line=dict(color="orange", width=2)))
-            fig4.add_hline(y=36.5, line_dash="dash", line_color="green", annotation_text="Normal Low")
-            fig4.add_hline(y=37.5, line_dash="dash", line_color="green", annotation_text="Normal High")
-            fig4.update_layout(title="Temperature Trend", xaxis_title="Time",
-                                yaxis_title="Temp (°C)", height=400, hovermode="x unified")
-            st.plotly_chart(fig4, use_container_width=True)
+    if vs_df.empty:
+        st.info(
+            "ℹ️ Belum ada data vital signs. "
+            "Simpan data di tab **Real-Time Monitor** atau **🩺 TTV Realtime Input** terlebih dahulu."
+        )
     else:
-        st.info("ℹ️ Belum ada data vital signs untuk di-analisis")
+        vs_df["timestamp"] = pd.to_datetime(vs_df["timestamp"])
+        vs_df = vs_df.sort_values("timestamp").reset_index(drop=True)
 
-    if is_intubated:
+        # ── Hitung MAP otomatis dari SBP & DBP ───────────────────────────────
+        vs_df["_map"] = vs_df.apply(
+            lambda r: _calc_map_fs(r.get("systolic_bp"), r.get("diastolic_bp")), axis=1
+        )
+
+        # ── Ambil 6 titik terbaru untuk flowsheet ────────────────────────────
+        recent6 = vs_df.tail(6).reset_index(drop=True)
+
+        # Info sumber
+        if "source" in vs_df.columns:
+            src_info = " · ".join(
+                f"{k}: {v}" for k, v in vs_df["source"].value_counts().items()
+            )
+            st.caption(f"📡 Sumber data: {src_info} | Total titik: **{len(vs_df)}**")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TABEL FLOWSHEET
+        # ══════════════════════════════════════════════════════════════════════
+        time_labels = []
+        for _, row in recent6.iterrows():
+            ts = row["timestamp"]
+            time_labels.append(ts.strftime("%H:%M") if pd.notna(ts) else "—")
+
+        # Build HTML table — baris = parameter, kolom = waktu
+        header_cells = "".join(
+            f"<th style='background:#2c3e50;color:#fff;text-align:center;"
+            f"padding:7px 12px;font-size:12px;white-space:nowrap'>{t}</th>"
+            for t in time_labels
+        )
+        # Padding jika < 6 titik
+        empty_th = "".join(
+            "<th style='background:#34495e;color:#888'></th>"
+            for _ in range(6 - len(recent6))
+        )
+
+        rows_html = ""
+        for (col_key, label, unit, *_) in _FS_PARAMS:
+            cells_html = ""
+            for _, row in recent6.iterrows():
+                val = row.get(col_key)
+                if val is None or (hasattr(val, "__class__") and str(val) == "nan"):
+                    cells_html += (
+                        "<td style='text-align:center;color:#aaa;"
+                        "padding:6px 8px;font-size:13px'>—</td>"
+                    )
+                else:
+                    try:
+                        val_f = float(val)
+                    except (TypeError, ValueError):
+                        val_f = None
+                    if val_f is not None:
+                        bg, tc = _fs_cell_bg(col_key, val_f)
+                        disp = f"{val_f:.1f}" if col_key in ("body_temp", "_map", "cvp") else f"{val_f:.0f}"
+                    else:
+                        bg, tc = "#f8f9fa", "#6c757d"
+                        disp = str(val)
+                    cells_html += (
+                        f"<td style='text-align:center;background:{bg};color:{tc};"
+                        f"font-weight:600;padding:6px 8px;font-size:13px'>{disp}</td>"
+                    )
+            # Padding kolom kosong
+            cells_html += "".join(
+                "<td style='background:#f8f9fa'></td>"
+                for _ in range(6 - len(recent6))
+            )
+            rows_html += (
+                f"<tr>"
+                f"<td style='padding:6px 12px;font-weight:600;font-size:12px;"
+                f"white-space:nowrap;background:#ecf0f1;border-right:2px solid #bdc3c7'>"
+                f"{label}<br><span style='font-weight:normal;color:#7f8c8d;font-size:10px'>"
+                f"({unit})</span></td>"
+                f"{cells_html}"
+                f"</tr>"
+            )
+
+        table_html = f"""
+<div style="overflow-x:auto;margin:10px 0 16px 0">
+<table style="border-collapse:collapse;width:100%;font-family:sans-serif;
+              border:1px solid #dee2e6;border-radius:6px;overflow:hidden">
+  <thead>
+    <tr>
+      <th style="background:#2c3e50;color:#fff;text-align:left;
+                 padding:7px 12px;font-size:12px;border-right:2px solid #4a6278">
+        Parameter
+      </th>
+      {header_cells}{empty_th}
+    </tr>
+  </thead>
+  <tbody>{rows_html}</tbody>
+</table>
+</div>
+<p style="font-size:11px;color:#888;margin-top:4px">
+  🟢 Normal &nbsp;·&nbsp; 🟡 Borderline &nbsp;·&nbsp; 🔴 Kritis
+  &nbsp;|&nbsp; MAP = DBP + ⅓ × (SBP − DBP)
+</p>"""
+        st.markdown(table_html, unsafe_allow_html=True)
+
+        # ── Ringkasan nilai terbaru (metric cards) ────────────────────────────
+        if len(recent6) >= 1:
+            last_row = recent6.iloc[-1]
+            prev_row = recent6.iloc[-2] if len(recent6) >= 2 else None
+
+            st.markdown("##### 📌 Nilai Terbaru")
+            met_cols = st.columns(8)
+            for ci, (col_key, label, unit, *_) in enumerate(_FS_PARAMS):
+                v   = last_row.get(col_key)
+                pv  = prev_row.get(col_key) if prev_row is not None else None
+                try:
+                    v_f  = float(v)  if v  is not None else None
+                    pv_f = float(pv) if pv is not None else None
+                except (TypeError, ValueError):
+                    v_f, pv_f = None, None
+                delta = round(v_f - pv_f, 1) if (v_f is not None and pv_f is not None) else None
+                bg, _ = _fs_cell_bg(col_key, v_f) if v_f is not None else ("#f8f9fa", "#6c757d")
+                icon  = {"#d4edda":"🟢","#fff3cd":"🟡","#f8d7da":"🔴"}.get(bg, "⚪")
+                disp  = f"{v_f:.1f} {unit}" if v_f is not None else "—"
+                met_cols[ci].metric(
+                    label=f"{icon} {label}",
+                    value=disp,
+                    delta=f"{delta:+.1f}" if delta is not None else None,
+                )
+
         st.markdown("---")
-        st.markdown("### 🫁 Ventilator Parameter Trend")
-        vent_df = get_ventilator_history(patient_id, hours=trend_hours)
-        if not vent_df.empty:
-            vent_df["timestamp"] = pd.to_datetime(vent_df["timestamp"])
-            col1, col2 = st.columns(2)
-            with col1:
-                fig5 = go.Figure()
-                fig5.add_trace(go.Scatter(x=vent_df["timestamp"], y=vent_df["peak_pressure"],
-                                           mode="lines+markers", name="Peak Pressure",
-                                           line=dict(color="red", width=2)))
-                fig5.add_hline(y=30, line_dash="dash", line_color="red", annotation_text="Alert >30")
-                fig5.update_layout(title="Peak Pressure Trend", xaxis_title="Time",
-                                    yaxis_title="Pressure (cmH2O)", height=400)
-                st.plotly_chart(fig5, use_container_width=True)
-            with col2:
-                fig6 = go.Figure()
-                fig6.add_trace(go.Scatter(x=vent_df["timestamp"], y=vent_df["fio2"],
-                                           mode="lines+markers", name="FiO2",
-                                           line=dict(color="blue", width=2)))
-                fig6.update_layout(title="FiO2 Trend", xaxis_title="Time",
-                                    yaxis_title="FiO2 (%)", height=400)
-                st.plotly_chart(fig6, use_container_width=True)
-        else:
-            st.info("ℹ️ Belum ada data ventilator untuk di-analisis")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # TREND CHART MULTI-PARAMETER (semua data, bukan hanya 6 terakhir)
+        # ══════════════════════════════════════════════════════════════════════
+        st.markdown("##### 📈 Grafik Tren Tanda Vital")
+
+        # Pilih parameter yang ingin ditampilkan di chart
+        _param_opts = {r[1]: r[0] for r in _FS_PARAMS}
+        selected_params = st.multiselect(
+            "Pilih parameter untuk grafik:",
+            options=list(_param_opts.keys()),
+            default=["HR / Nadi", "TD Sistolik", "TD Diastolik", "MAP", "SpO₂"],
+            key="fs_chart_params",
+        )
+
+        if selected_params:
+            fig_main = go.Figure()
+            for param_label in selected_params:
+                col_key = _param_opts[param_label]
+                cfg     = next(r for r in _FS_PARAMS if r[0] == col_key)
+                _, lbl, unit, n_lo, n_hi, a_lo, a_hi, color = cfg
+
+                y_vals = vs_df[col_key].tolist() if col_key in vs_df.columns else []
+                if not any(v is not None for v in y_vals):
+                    continue
+
+                fig_main.add_trace(go.Scatter(
+                    x=vs_df["timestamp"],
+                    y=vs_df[col_key],
+                    name=f"{lbl} ({unit})",
+                    mode="lines+markers",
+                    line=dict(color=color, width=2),
+                    marker=dict(size=6),
+                    connectgaps=True,
+                    hovertemplate=f"<b>{lbl}</b>: %{{y:.1f}} {unit}<extra></extra>",
+                ))
+
+                # Garis batas normal (hanya untuk 1 parameter pertama agar tidak terlalu ramai)
+                if param_label == selected_params[0]:
+                    fig_main.add_hline(
+                        y=n_lo, line_dash="dot", line_color=color,
+                        line_width=1, opacity=0.4,
+                        annotation_text=f"↓ min {n_lo}", annotation_font_size=9,
+                    )
+                    fig_main.add_hline(
+                        y=n_hi, line_dash="dot", line_color=color,
+                        line_width=1, opacity=0.4,
+                        annotation_text=f"↑ max {n_hi}", annotation_font_size=9,
+                    )
+
+            fig_main.update_layout(
+                height=350,
+                margin=dict(l=0, r=0, t=10, b=10),
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="left", x=0, font=dict(size=10),
+                ),
+                xaxis=dict(title=None, showgrid=True, gridcolor="#eee"),
+                yaxis=dict(title="Nilai", showgrid=True, gridcolor="#eee"),
+                plot_bgcolor="#fafafa",
+                paper_bgcolor="rgba(0,0,0,0)",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_main, use_container_width=True)
+
+        # ── Ventilator flowsheet (jika intubasi) ──────────────────────────────
+        if is_intubated:
+            st.markdown("---")
+            st.markdown("### 🫁 Flowsheet Parameter Ventilator")
+
+            vent_df = get_ventilator_history(patient_id, hours=trend_hours)
+            if vent_df.empty:
+                st.info("ℹ️ Belum ada data ventilator tersimpan.")
+            else:
+                vent_df["timestamp"] = pd.to_datetime(vent_df["timestamp"])
+                vent_df = vent_df.sort_values("timestamp").reset_index(drop=True)
+                vent6   = vent_df.tail(6).reset_index(drop=True)
+
+                _VP = [
+                    ("fio2",                "FiO₂",          "%",     0.21, 0.6,  "#e74c3c"),
+                    ("peep",                "PEEP",           "cmH₂O", 4,    10,   "#3498db"),
+                    ("tidal_volume",        "Tidal Vol",      "mL",    350,  550,  "#2ecc71"),
+                    ("rate_set",            "RR Set",         "/mnt",  10,   20,   "#f39c12"),
+                    ("peak_pressure",       "Peak Pressure",  "cmH₂O", 10,   25,   "#e67e22"),
+                    ("mean_airway_pressure","MAP Airway",     "cmH₂O", 8,    20,   "#9b59b6"),
+                ]
+
+                _vent_time_labels = [
+                    r["timestamp"].strftime("%H:%M") if pd.notna(r["timestamp"]) else "—"
+                    for _, r in vent6.iterrows()
+                ]
+
+                v_header = "".join(
+                    f"<th style='background:#1a5276;color:#fff;text-align:center;"
+                    f"padding:7px 10px;font-size:12px'>{t}</th>"
+                    for t in _vent_time_labels
+                )
+                v_empty = "".join(
+                    "<th style='background:#1f618d;color:#888'></th>"
+                    for _ in range(6 - len(vent6))
+                )
+
+                v_rows = ""
+                for (vk, vl, vu, vn_lo, vn_hi, vc) in _VP:
+                    vcells = ""
+                    for _, row in vent6.iterrows():
+                        val = row.get(vk)
+                        try:
+                            vf = float(val)
+                            if vk == "fio2":
+                                vf = vf * 100 if vf <= 1.0 else vf
+                            disp = f"{vf:.0f}" if vk in ("tidal_volume","rate_set") else f"{vf:.1f}"
+                            lo = vn_lo * 100 if vk == "fio2" and vn_lo <= 1.0 else vn_lo
+                            hi = vn_hi * 100 if vk == "fio2" and vn_hi <= 1.0 else vn_hi
+                            if vf < lo or vf > hi:
+                                bg, tc = "#fff3cd", "#856404"
+                            else:
+                                bg, tc = "#d4edda", "#155724"
+                            if vk == "peak_pressure" and vf > 30:
+                                bg, tc = "#f8d7da", "#721c24"
+                        except Exception:
+                            bg, tc, disp = "#f8f9fa", "#aaa", "—"
+                        vcells += (
+                            f"<td style='text-align:center;background:{bg};color:{tc};"
+                            f"font-weight:600;padding:6px 8px;font-size:13px'>{disp}</td>"
+                        )
+                    vcells += "".join(
+                        "<td style='background:#f8f9fa'></td>"
+                        for _ in range(6 - len(vent6))
+                    )
+                    v_rows += (
+                        f"<tr><td style='padding:6px 12px;font-weight:600;font-size:12px;"
+                        f"white-space:nowrap;background:#d6eaf8;border-right:2px solid #a9cce3'>"
+                        f"<span style='color:{vc}'>■</span> {vl} ({vu})</td>{vcells}</tr>"
+                    )
+
+                vent_table = f"""
+<div style="overflow-x:auto;margin:8px 0 14px 0">
+<table style="border-collapse:collapse;width:100%;font-family:sans-serif;
+              border:1px solid #a9cce3">
+  <thead>
+    <tr>
+      <th style="background:#1a5276;color:#fff;text-align:left;
+                 padding:7px 12px;font-size:12px;border-right:2px solid #2e86c1">
+        Parameter Ventilator
+      </th>
+      {v_header}{v_empty}
+    </tr>
+  </thead>
+  <tbody>{v_rows}</tbody>
+</table>
+</div>"""
+                st.markdown(vent_table, unsafe_allow_html=True)
+
+                # Trend chart ventilator
+                fig_vent = go.Figure()
+                for (vk, vl, vu, vn_lo, vn_hi, vc) in _VP:
+                    y_data = vent_df[vk].copy() if vk in vent_df.columns else None
+                    if y_data is None:
+                        continue
+                    if vk == "fio2":
+                        y_data = y_data.apply(lambda x: x*100 if x is not None and float(x) <= 1.0 else x)
+                    fig_vent.add_trace(go.Scatter(
+                        x=vent_df["timestamp"], y=y_data,
+                        name=f"{vl} ({vu})", mode="lines+markers",
+                        line=dict(color=vc, width=2), marker=dict(size=5),
+                        connectgaps=True,
+                    ))
+                fig_vent.update_layout(
+                    height=300,
+                    margin=dict(l=0, r=0, t=10, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, font=dict(size=10)),
+                    xaxis=dict(title=None, showgrid=True, gridcolor="#eee"),
+                    yaxis=dict(title="Nilai", showgrid=True, gridcolor="#eee"),
+                    plot_bgcolor="#fafafa",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_vent, use_container_width=True)
 
 # =============================================================================
 # TAB — Infusion Pump
