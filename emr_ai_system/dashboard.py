@@ -4,6 +4,7 @@
 
 import io
 import re
+import html
 import logging
 import random
 import sqlite3
@@ -197,6 +198,84 @@ try:
 except Exception as exc:
     AI_NORMALIZE_AVAILABLE = False
     logger.info("AI normalizer (Ollama) nonaktif: %s", exc)
+
+
+# ── 8B. GOOGLE CLOUD TRANSLATION API CONFIGURATION ───────────────────────────
+# Fitur translate (Inggris → Indonesia) memakai Google Cloud Translation API.
+# Ini TERPISAH dari Ollama di atas — Ollama tetap dipakai khusus untuk
+# normalize_clinical_transcript() (filter/standarisasi hasil speech-to-text).
+#
+# Cara mengaktifkan — set API key lewat salah satu cara:
+#   1) .streamlit/secrets.toml  →  GOOGLE_TRANSLATE_API_KEY = "AIza..."
+#   2) environment variable     →  GOOGLE_TRANSLATE_API_KEY=AIza...
+#
+# Cara mendapatkan API key:
+#   1. Buka https://console.cloud.google.com/ → buat/pilih project
+#   2. API Library → aktifkan "Cloud Translation API"
+#   3. APIs & Services → Credentials → Create Credentials → API key
+#   4. (Disarankan) batasi API key tsb hanya untuk Cloud Translation API
+#   Tier gratis: 500.000 karakter/bulan.
+
+def _get_google_translate_config() -> str:
+    """Ambil Google Cloud Translation API key dari secrets/env."""
+    try:
+        api_key = st.secrets.get("GOOGLE_TRANSLATE_API_KEY", "")
+    except Exception:
+        api_key = ""
+    if not api_key:
+        api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY", "")
+    return api_key
+
+
+_GOOGLE_TRANSLATE_API_KEY = _get_google_translate_config()
+_GOOGLE_TRANSLATE_URL     = "https://translation.googleapis.com/language/translate/v2"
+
+# Istilah medis yang HARUS dipertahankan apa adanya (tidak ikut diterjemahkan).
+# Dicocokkan utuh per kata (word-boundary), tanpa peduli huruf besar/kecil.
+_PROTECTED_MEDICAL_TERMS = [
+    "SpO2", "EF", "LVEF", "STEMI", "NSTEMI", "ACS", "PCI", "EKG", "ECG",
+    "MAP", "HR", "RR", "BP", "GCS", "ICU", "IGD",
+    "dyspnea", "edema", "orthopnea", "angina", "syncope", "aorta",
+    "stent", "bypass", "atrial",
+]
+_PROTECTED_TERMS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(t) for t in _PROTECTED_MEDICAL_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+# Angka + satuan klinis yang formatnya jangan sampai diubah/diterjemahkan
+_PROTECTED_NUMERIC_RE = re.compile(
+    r"\d+(?:[.,]\d+)?(?:\s*/\s*\d+(?:[.,]\d+)?)?\s*"
+    r"(?:mmHg|bpm|x/menit|x/mnt|°C|%|kg|cm)",
+    re.IGNORECASE,
+)
+
+
+def _wrap_notranslate(match: "re.Match") -> str:
+    """Bungkus token yang match dengan <span translate="no">, mekanisme resmi
+    Google Translate untuk mengecualikan teks tertentu dari proses terjemahan."""
+    return f'<span translate="no">{match.group(0)}</span>'
+
+
+# Cek ketersediaan Google Cloud Translation API saat startup (non-blocking)
+try:
+    if not _GOOGLE_TRANSLATE_API_KEY:
+        raise RuntimeError("GOOGLE_TRANSLATE_API_KEY belum diset di secrets/env")
+    _gt_health = requests.get(
+        f"{_GOOGLE_TRANSLATE_URL}/languages",
+        params={"key": _GOOGLE_TRANSLATE_API_KEY, "target": "id"},
+        timeout=5,
+    )
+    if _gt_health.status_code == 200:
+        GOOGLE_TRANSLATE_AVAILABLE = True
+        logger.info("Google Cloud Translation API tersedia.")
+    else:
+        raise RuntimeError(
+            f"Google Translate health check HTTP {_gt_health.status_code}: "
+            f"{_gt_health.text[:200]}"
+        )
+except Exception as exc:
+    GOOGLE_TRANSLATE_AVAILABLE = False
+    logger.info("Google Cloud Translation API nonaktif: %s", exc)
 
 
 # =============================================================================
@@ -591,54 +670,70 @@ def _detect_language_heuristic(text: str) -> str:
 def translate_to_indonesian(text: str, field: str = "S") -> str:
     """
     Terjemahkan teks klinis dari bahasa Inggris ke Indonesia menggunakan
-    Ollama/Qwen on-premise.
+    Google Cloud Translation API.
 
-    - Hanya menerjemahkan, tidak menambah interpretasi klinis.
-    - Istilah medis baku (SpO2, EF, LVEF, ACS, dll.) DIBIARKAN apa adanya.
-    - Angka, satuan, dan singkatan standar tidak diubah.
-    - Jika AI tidak tersedia atau gagal → kembalikan teks asli (graceful degradation).
-    - Jika teks terdeteksi sudah Indonesia → kembalikan langsung tanpa panggil Ollama.
+    - Hanya menerjemahkan; tidak menambah interpretasi klinis apapun.
+    - Istilah medis baku (SpO2, EF, LVEF, ACS, HR, BP, dll.) dan angka/satuan
+      klinis (mmHg, bpm, %, °C) DIBIARKAN apa adanya, memakai mekanisme resmi
+      Google Translate <span translate="no">...</span> (format=html).
+    - Jika API tidak tersedia → kembalikan teks asli (graceful degradation).
+    - Jika gagal (network/API error) → exception di-raise ulang agar pemanggil
+      bisa menampilkan pesan error yang jelas ke user.
+
+    Parameter `field` dipertahankan untuk kompatibilitas signature dengan
+    pemanggil lama; Google Translate API tidak memakainya sebagai konteks
+    (berbeda dari versi Ollama sebelumnya yang menyisipkannya ke prompt).
     """
-    if not AI_NORMALIZE_AVAILABLE:
+    if not GOOGLE_TRANSLATE_AVAILABLE:
         return text
     if not text or text.startswith("["):
         return text
 
-    field_label = (
-        "Subjektif (keluhan pasien)" if field == "S"
-        else "Objektif (TTV/pemeriksaan fisik/penunjang)"
-    )
-    system_prompt = (
-        "Kamu adalah penerjemah rekam medis. "
-        "Tugasmu: terjemahkan teks bahasa Inggris berikut ke bahasa Indonesia baku rekam medis rumah sakit.\n\n"
-        "ATURAN KETAT:\n"
-        "1. Output HANYA teks terjemahan. Dilarang menulis penjelasan, catatan, atau kalimat tambahan apapun.\n"
-        "2. Dilarang menulis ulang input aslinya.\n"
-        "3. Istilah medis berikut JANGAN diterjemahkan, tulis apa adanya: "
-        "SpO2, EF, LVEF, STEMI, NSTEMI, ACS, PCI, EKG, ECG, MAP, HR, RR, BP, GCS, "
-        "dyspnea, edema, orthopnea, palpitasi, syncope, angina, aritmia, takikardia, bradikardi, "
-        "fibrilasi, atrial, ventrikel, aorta, kateter, stent, bypass, ICU, IGD.\n"
-        "4. Angka dan satuan JANGAN diubah: 120/80 mmHg, 98%, 80 bpm, 36.5°C, dll.\n"
-        "5. Terjemahan harus alami dan sesuai gaya catatan keperawatan Indonesia.\n\n"
-        "CONTOH BENAR:\n"
-        "Input: 'Patient complains of chest pain since 30 minutes ago, radiating to left arm.'\n"
-        "Output: Pasien mengeluh nyeri dada sejak 30 menit yang lalu, menjalar ke lengan kiri.\n\n"
-        "Input: 'Shortness of breath with SpO2 94%, HR 110 bpm, BP 90/60 mmHg.'\n"
-        "Output: Sesak napas dengan SpO2 94%, HR 110 bpm, BP 90/60 mmHg.\n\n"
-        f"Konteks: data {field_label} pada pasien jantung. Sekarang terjemahkan:"
-    )
+    # Lindungi istilah medis & angka/satuan dari terjemahan, dengan
+    # membungkusnya di <span translate="no"> (format=html resmi Google).
+    escaped = html.escape(text)
+    protected = _PROTECTED_NUMERIC_RE.sub(_wrap_notranslate, escaped)
+    protected = _PROTECTED_TERMS_RE.sub(_wrap_notranslate, protected)
 
     try:
-        translated = _ollama_generate(
-            system_prompt=system_prompt,
-            user_text=text,
-            num_predict=512,
-            temperature=0.1,
-            timeout=45,
+        resp = requests.post(
+            _GOOGLE_TRANSLATE_URL,
+            params={"key": _GOOGLE_TRANSLATE_API_KEY},
+            json={
+                "q": protected,
+                "source": "en",
+                "target": "id",
+                "format": "html",
+            },
+            timeout=15,
         )
-        return translated if translated else text
+        resp.raise_for_status()
+        data = resp.json()
+        translations = data.get("data", {}).get("translations", [])
+        if not translations:
+            raise RuntimeError(f"Respons Google Translate tidak berisi hasil terjemahan: {data}")
+        result_html = translations[0].get("translatedText", "")
+        # Buang tag <span translate="no">...</span> (sisa proteksi istilah),
+        # lalu decode entity HTML agar hasil akhir berupa teks polos.
+        result = re.sub(r"</?span[^>]*>", "", result_html)
+        result = html.unescape(result).strip()
+        return result if result else text
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            "Tidak dapat terhubung ke Google Translation API. Periksa koneksi internet."
+        )
+    except requests.exceptions.HTTPError as e:
+        detail = ""
+        try:
+            detail = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Google Translate HTTP error: {detail or e}. "
+            "Periksa API key & pastikan Cloud Translation API sudah diaktifkan di GCP project."
+        )
     except Exception as exc:
-        logger.warning("translate_to_indonesian (Ollama) error: %s", exc)
+        logger.warning("translate_to_indonesian (Google) error: %s", exc)
         raise  # re-raise agar pemanggil (_do_translate_s/o) bisa tampilkan error ke user
 
 
@@ -3750,12 +3845,24 @@ def main_app() -> None:
                 "Teks akan otomatis ditambahkan ke kolom S atau O di bawah. "
                 "Bisa dilanjutkan dengan pengetikan manual."
             )
-            if AI_NORMALIZE_AVAILABLE:
-                st.caption("🧠 Filter & standarisasi istilah klinis berbasis AI: **Aktif** | 🌐 Auto-translate Inggris → Indonesia: **Aktif**")
-            else:
+            _ai_status = (
+                "🧠 Filter & standarisasi istilah klinis: **Aktif**" if AI_NORMALIZE_AVAILABLE
+                else "🧠 Filter & standarisasi istilah klinis: **Nonaktif**"
+            )
+            _gt_status = (
+                "🌐 Auto-translate Inggris → Indonesia: **Aktif**" if GOOGLE_TRANSLATE_AVAILABLE
+                else "🌐 Auto-translate Inggris → Indonesia: **Nonaktif**"
+            )
+            st.caption(f"{_ai_status} | {_gt_status}")
+            if not AI_NORMALIZE_AVAILABLE:
                 st.caption(
-                    "🧠 Filter AI: **Nonaktif** (teks dipakai apa adanya dari speech-to-text). "
+                    "↳ Filter AI memakai teks apa adanya dari speech-to-text. "
                     "Aktifkan dengan: pastikan Ollama berjalan (`ollama serve`) dan model tersedia (`ollama pull qwen2.5`)."
+                )
+            if not GOOGLE_TRANSLATE_AVAILABLE:
+                st.caption(
+                    "↳ Aktifkan auto-translate dengan: set `GOOGLE_TRANSLATE_API_KEY` di secrets/env "
+                    "(lihat komentar konfigurasi Google Cloud Translation API di bagian atas kode)."
                 )
             vcol1, vcol2 = st.columns(2)
 
@@ -3775,10 +3882,14 @@ def main_app() -> None:
                         if AI_NORMALIZE_AVAILABLE:
                             with st.spinner("🧹 Membersihkan & menstandarisasi istilah klinis..."):
                                 hasil_s = normalize_clinical_transcript(hasil_s, field="S")
-                            # Auto-translate jika hasil STT terdeteksi bahasa Inggris
-                            if _detect_language_heuristic(hasil_s) == "en":
-                                with st.spinner("🌐 Mendeteksi bahasa Inggris — menerjemahkan ke Indonesia..."):
+                        # Auto-translate jika terdeteksi bahasa Inggris (independen dari filter di atas)
+                        if GOOGLE_TRANSLATE_AVAILABLE and _detect_language_heuristic(hasil_s) == "en":
+                            with st.spinner("🌐 Mendeteksi bahasa Inggris — menerjemahkan ke Indonesia..."):
+                                try:
                                     hasil_s = translate_to_indonesian(hasil_s, field="S")
+                                except Exception as exc:
+                                    logger.warning("Auto-translate S gagal: %s", exc)
+                                    st.warning(f"⚠️ Auto-translate gagal, teks asli dipakai: {exc}")
                         prev = st.session_state.s_text_area
                         st.session_state.s_text_area = (
                             (prev + " " + hasil_s).strip() if prev else hasil_s
@@ -3803,10 +3914,14 @@ def main_app() -> None:
                         if AI_NORMALIZE_AVAILABLE:
                             with st.spinner("🧹 Membersihkan & menstandarisasi istilah klinis..."):
                                 hasil_o = normalize_clinical_transcript(hasil_o, field="O")
-                            # Auto-translate jika hasil STT terdeteksi bahasa Inggris
-                            if _detect_language_heuristic(hasil_o) == "en":
-                                with st.spinner("🌐 Mendeteksi bahasa Inggris — menerjemahkan ke Indonesia..."):
+                        # Auto-translate jika terdeteksi bahasa Inggris (independen dari filter di atas)
+                        if GOOGLE_TRANSLATE_AVAILABLE and _detect_language_heuristic(hasil_o) == "en":
+                            with st.spinner("🌐 Mendeteksi bahasa Inggris — menerjemahkan ke Indonesia..."):
+                                try:
                                     hasil_o = translate_to_indonesian(hasil_o, field="O")
+                                except Exception as exc:
+                                    logger.warning("Auto-translate O gagal: %s", exc)
+                                    st.warning(f"⚠️ Auto-translate gagal, teks asli dipakai: {exc}")
                         prev = st.session_state.o_text_area
                         st.session_state.o_text_area = (
                             (prev + " " + hasil_o).strip() if prev else hasil_o
@@ -3854,9 +3969,9 @@ def main_app() -> None:
                 st.session_state["s_text_area"] = result
                 st.session_state["_translate_s_msg"] = ("success", "✅ Kolom S berhasil diterjemahkan!")
             else:
-                # Ollama mungkin tidak berjalan atau model belum dimuat
+                # Google Translate API mungkin belum dikonfigurasi / tidak merespons
                 st.session_state["_translate_s_msg"] = ("error",
-                    "❌ Translate gagal — pastikan Ollama berjalan dan model tersedia. "
+                    "❌ Translate gagal — periksa GOOGLE_TRANSLATE_API_KEY & koneksi internet. "
                     f"(Input: {len(raw)} karakter, Output: {len(result) if result else 0} karakter)")
         except Exception as exc:
             st.session_state["_translate_s_msg"] = ("error", f"❌ Error: {exc}")
@@ -3875,7 +3990,7 @@ def main_app() -> None:
                 st.session_state["_translate_o_msg"] = ("success", "✅ Kolom O berhasil diterjemahkan!")
             else:
                 st.session_state["_translate_o_msg"] = ("error",
-                    "❌ Translate gagal — pastikan Ollama berjalan dan model tersedia. "
+                    "❌ Translate gagal — periksa GOOGLE_TRANSLATE_API_KEY & koneksi internet. "
                     f"(Input: {len(raw)} karakter, Output: {len(result) if result else 0} karakter)")
         except Exception as exc:
             st.session_state["_translate_o_msg"] = ("error", f"❌ Error: {exc}")
@@ -3903,9 +4018,9 @@ def main_app() -> None:
                 "🌐 Translate → Indonesia",
                 key="translate_s_btn",
                 use_container_width=True,
-                disabled=not AI_NORMALIZE_AVAILABLE,
+                disabled=not GOOGLE_TRANSLATE_AVAILABLE,
                 on_click=_do_translate_s,
-                help="Terjemahkan teks kolom S dari Inggris ke Indonesia menggunakan AI on-premise (Ollama/Qwen).",
+                help="Terjemahkan teks kolom S dari Inggris ke Indonesia menggunakan Google Cloud Translation API.",
             )
             # Tampilkan pesan hasil translate (diset oleh callback _do_translate_s)
             _msg_s = st.session_state.pop("_translate_s_msg", None)
@@ -3939,9 +4054,9 @@ def main_app() -> None:
                 "🌐 Translate → Indonesia",
                 key="translate_o_btn",
                 use_container_width=True,
-                disabled=not AI_NORMALIZE_AVAILABLE,
+                disabled=not GOOGLE_TRANSLATE_AVAILABLE,
                 on_click=_do_translate_o,
-                help="Terjemahkan teks kolom O dari Inggris ke Indonesia menggunakan AI on-premise (Ollama/Qwen).",
+                help="Terjemahkan teks kolom O dari Inggris ke Indonesia menggunakan Google Cloud Translation API.",
             )
             # Tampilkan pesan hasil translate (diset oleh callback _do_translate_o)
             _msg_o = st.session_state.pop("_translate_o_msg", None)
