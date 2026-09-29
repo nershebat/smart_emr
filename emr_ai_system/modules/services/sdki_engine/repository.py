@@ -665,6 +665,27 @@ _KONTEKS_LABEL: dict[str, str] = {
     "support": "Dukungan Sirkulasi Mekanik (ECMO/VAD/IABP)",
 }
 
+# Label konteks RINGKAS untuk ditampilkan sebagai ALASAN pada tiap usulan
+# (lebih pendek & manusiawi dari banner). Dipakai menggantikan penanda kabur
+# "(dari konteks klinis)" supaya perawat tahu dasar konteksnya.
+_KONTEKS_ALASAN: dict[str, str] = {
+    "shock": "syok",
+    "support": "dukungan sirkulasi mekanik",
+    "acs": "ACS/iskemia",
+    "hf": "gagal jantung akut",
+    "postop": "pasca-operasi jantung",
+    "mech": "komplikasi mekanik",
+}
+
+# Token terlalu umum untuk DITAMPILKAN sebagai alasan (modifier/kuantitas/
+# posisi tanpa makna klinis mandiri). Ini HANYA menyaring TAMPILAN alasan,
+# BUKAN pencocokan/skor -- "cocok pada: dosis, tinggi" jadi bersih.
+_STOP_ALASAN = {
+    "dosis", "tinggi", "rendah", "besar", "kecil", "minimal", "banyak",
+    "sedikit", "ringan", "kiri", "kanan", "atas", "bawah", "frekuensi",
+    "lebih", "kurang", "sekitar", "tampak", "adanya",
+}
+
 # Nama diagnosa kanonik (dipetakan ke kode master aktif saat runtime).
 _N_PCJ = "Penurunan Curah Jantung"
 _N_RPCJ = "Risiko Penurunan Curah Jantung"
@@ -1023,20 +1044,92 @@ class SdkiRepository:
     def _kode_dari_nama(self, nama: str) -> str | None:
         return self._nama_index().get(_norm_nama(nama))
 
+    @staticmethod
+    def _rapikan_alasan(matched, kode, alasan_konteks, dari_konteks,
+                        bobot, bobot_bawaan, low_text="") -> list[str]:
+        """
+        Susun daftar 'cocok pada' yang JELAS bagi perawat:
+          * tanda terukur (mis. 'tekanan darah rendah') di depan;
+          * kata yang BERSEBELAHAN di teks asli digabung jadi frasa utuh
+            (mis. 'penyakit jantung bawaan', 'akral dingin') supaya konsep
+            multi-kata tak terpecah jadi token lepas -- ini juga menyelamatkan
+            kata umum yang bermakna DALAM frasa ('berat badan') sambil tetap
+            menyembunyikannya bila berdiri sendiri (dosis/tinggi/kiri/...);
+          * alasan konteks ditulis manusiawi ('konteks: syok, dukungan
+            sirkulasi mekanik') menggantikan penanda kabur '(dari konteks
+            klinis)'. Untuk diagnosis yang MUNCUL karena konteks, konteks
+            ditaruh paling depan sebagai dasar utama.
+        Murni untuk TAMPILAN -- tidak menyentuh skor/pemeringkatan.
+        """
+        kata = {m for m in matched if " " not in m}      # token tunggal
+        frasa_ukur = [m for m in matched if " " in m]     # label terukur (sudah frasa)
+
+        # Gabungkan token cocok yang berdampingan di teks asli menjadi frasa.
+        # Tanda baca (koma/titik/'+'/'/'...) MEMUTUS frasa supaya klausa
+        # terpisah tak terangkai ('akral dingin, CRT' -> 'akral dingin'
+        # dan 'crt' terpisah, bukan 'akral dingin crt'). Frasa yang
+        # SELURUHNYA kata umum
+        # (mis. 'dosis tinggi') dibuang -- itu derau, bukan konsep klinis.
+        frasa_teks: list[str] = []
+        terpakai: set[str] = set()
+        for klausa in re.split(r"[^a-z0-9 ]+", low_text.lower()):
+            seq = re.findall(r"[a-z]+\d*", klausa)
+            i = 0
+            while i < len(seq):
+                if seq[i] in kata:
+                    j = i
+                    while j < len(seq) and seq[j] in kata:
+                        j += 1
+                    frase = seq[i:j]
+                    if len(frase) >= 2 and any(t not in _STOP_ALASAN for t in frase):
+                        frasa_teks.append(" ".join(frase))
+                        terpakai.update(frase)
+                    i = j
+                else:
+                    i += 1
+        # de-dup frasa (jaga urutan kemunculan)
+        _lihat: set[str] = set()
+        frasa_teks = [f for f in frasa_teks if not (f in _lihat or _lihat.add(f))]
+
+        # Token yang sudah masuk frasa tak diulang; sisanya disaring stopword.
+        singel = [k for k in kata if k not in terpakai and k not in _STOP_ALASAN]
+
+        def _w(frasa: str) -> float:  # bobot frasa = jumlah bobot kata penyusun
+            return sum(bobot.get(t, bobot_bawaan) for t in frasa.split())
+
+        # Urut utama = bobot (tanda spesifik/langka di depan); tiebreak
+        # alfabet supaya urutan DETERMINISTIK (tak tergantung hash-seed set).
+        frasa = frasa_ukur + frasa_teks
+        frasa.sort(key=lambda s: (-_w(s), s))
+        singel.sort(key=lambda s: (-bobot.get(s, bobot_bawaan), s))
+        tampil = frasa + singel
+
+        labels = alasan_konteks.get(kode) or []
+        kt = ("konteks: " + ", ".join(labels)) if labels else None
+        if dari_konteks:
+            hasil = ([kt] if kt else []) + tampil
+            return hasil or ["pertimbangan klinis"]
+        if kt:
+            return tampil + [kt]
+        return tampil or ["pertimbangan klinis"]
+
     def _boost_konteks_numerik(
         self, konteks: dict[str, bool], numerik: dict[str, str]
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, list[str]]]:
         """
-        Bangun tiga peta kode->poin dari konteks & numerik (via resolusi nama):
+        Bangun peta kode->poin dari konteks & numerik (via resolusi nama):
           * amp_konteks : boost dari konteks klinis (amplifikasi)
           * amp_numerik : boost dari magnitudo nilai numerik (amplifikasi)
           * surface     : skor absolut untuk MEMUNCULKAN diagnosis risiko
+          * alasan      : kode -> label konteks manusiawi (untuk ditampilkan)
         """
         amp_konteks: dict[str, float] = {}
         amp_numerik: dict[str, float] = {}
         surface: dict[str, float] = {}
+        alasan: dict[str, list[str]] = {}
 
-        def tambah(peta: dict[str, float], nama: str, poin: float, mode: str = "sum") -> None:
+        def tambah(peta: dict[str, float], nama: str, poin: float,
+                   mode: str = "sum", label: str | None = None) -> None:
             kode = self._kode_dari_nama(nama)
             if not kode:
                 return
@@ -1044,14 +1137,17 @@ class SdkiRepository:
                 peta[kode] = max(peta.get(kode, 0.0), poin)
             else:
                 peta[kode] = peta.get(kode, 0.0) + poin
+            if label and label not in alasan.setdefault(kode, []):
+                alasan[kode].append(label)
 
         for flag, aktif in konteks.items():
             if not aktif:
                 continue
+            lbl = _KONTEKS_ALASAN.get(flag)
             for nama, poin in _KONTEKS_AMP.get(flag, {}).items():
-                tambah(amp_konteks, nama, poin)
+                tambah(amp_konteks, nama, poin, label=lbl)
             for nama, skor in _KONTEKS_SURFACE.get(flag, {}).items():
-                tambah(surface, nama, skor, mode="max")
+                tambah(surface, nama, skor, mode="max", label=lbl)
 
         for param, level in numerik.items():
             spec = _NUMERIK_MAP.get(param)
@@ -1062,9 +1158,9 @@ class SdkiRepository:
                 continue
             targets = spec.get(level) if level in spec else spec.get("any", [])
             for nama in (targets or []):
-                tambah(amp_numerik, nama, poin)
+                tambah(amp_numerik, nama, poin)  # numerik ditampilkan terpisah
 
-        return amp_konteks, amp_numerik, surface
+        return amp_konteks, amp_numerik, surface, alasan
 
     def konteks_klinis(self, text: str) -> dict[str, Any]:
         """
@@ -1124,7 +1220,8 @@ class SdkiRepository:
         # --- Konteks klinis & numerik (gabungan CDSS 2.0) --------------------
         numerik = _ekstrak_numerik(text)
         konteks = _deteksi_konteks(text, numerik)
-        amp_konteks, amp_numerik, surface = self._boost_konteks_numerik(konteks, numerik)
+        amp_konteks, amp_numerik, surface, alasan_konteks = \
+            self._boost_konteks_numerik(konteks, numerik)
 
         scored = []
         for entry in self._entries():
@@ -1189,12 +1286,9 @@ class SdkiRepository:
             if score < min_score:
                 continue
 
-            kata_cocok = sorted(
-                matched,
-                key=lambda k: (0 if " " in k else 1, -bobot.get(k, bobot_bawaan)),
-            )
-            if dari_konteks:
-                kata_cocok = ["(dari konteks klinis)"] + kata_cocok
+            kata_cocok = self._rapikan_alasan(
+                matched, entry["kode"], alasan_konteks, dari_konteks,
+                bobot, bobot_bawaan, low_text)
 
             scored.append({
                 "diagnosis": entry,
@@ -1236,7 +1330,8 @@ class SdkiRepository:
                 "kode": kode,
                 "nama": entry.get("nama", ""),
                 "skor": skor,
-                "kata_cocok": ["(dari konteks klinis)"],
+                "kata_cocok": self._rapikan_alasan(
+                    set(), kode, alasan_konteks, True, bobot, bobot_bawaan),
                 "mayor_cocok": 0,
                 "mayor_total": len(entry.get("kriteria", {}).get("mayor", [])),
                 "konteks_boost": round(skor_surface, 1),
