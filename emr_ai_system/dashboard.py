@@ -15,7 +15,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Dict
 from pathlib import Path
-from modules.services.cdss_engine import analyze_clinical_trends_improved
+# Mesin CDSS gabungan (kriteria SDKI mayor/minor + deteksi konteks
+# kardiovaskular & boost numerik). Drop-in: format keluarannya sama dengan
+# analyze_clinical_trends_improved() CDSS 2.0, tapi data (kode, luaran,
+# intervensi) berasal dari SATU sumber master JSON yang kodenya sudah benar.
+from modules.services.sdki_engine import analyze_clinical_trends_improved
 try:
     from modules.services.cdss_dokter import analyze_icd10_dan_tatalaksana as _cdss_dokter_analyze
     CDSS_DOKTER_AVAILABLE = True
@@ -2979,8 +2983,15 @@ def call_cdss_api(s_input: str, o_input: str, use_api: bool = False) -> Dict:
         except Exception as e:
             logger.debug("CDSS API error: %s, using local engine", str(e))
     
-    logger.debug("Using local CDSS v2.0 engine")
+    logger.debug("Using SmartCarePlan gabungan engine (SDKI + konteks kardiovaskular)")
     result = analyze_clinical_trends_improved(s_input, o_input)
+    # Mesin gabungan sudah menyertakan luaran SLKI + intervensi SIKI dari master
+    # JSON (satu sumber kebenaran). Jika lengkap, LEWATI bridge_engine supaya
+    # tidak ditimpa tabel lokal berkode lama (mis. D.0015 vs D.0014). bridge
+    # tetap dipakai sebagai fallback bila mesin lama dipakai & intervensi kosong.
+    recs = result.get("recommendations") or []
+    if recs and all(r.get("rencana_intervensi") for r in recs):
+        return result
     result = bridge_engine(result, s_input, o_input)
     return result
 
