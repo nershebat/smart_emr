@@ -2995,6 +2995,37 @@ def call_cdss_api(s_input: str, o_input: str, use_api: bool = False) -> Dict:
     result = bridge_engine(result, s_input, o_input)
     return result
 
+def _nama_kanonik(asuhan: dict, kode: str) -> str:
+    """
+    Nama diagnosis dari hasil mesin CDSS (SUMBER KEBENARAN / master 3S),
+    bukan peta kode lama SDKI_NAME_MAPPING. Peta hanya cadangan terakhir bila
+    item tak membawa nama (mis. jalur fallback). Ini mencegah ketidaksinkronan
+    seperti D.0014 tampil "Gangguan Perfusi Serebral" padahal mesin memberi
+    "Risiko Perfusi Miokard Tidak Efektif".
+    """
+    nama = (
+        asuhan.get("diagnosa_keperawatan")
+        or asuhan.get("name")
+        or asuhan.get("nama_diagnosa")
+        or asuhan.get("diagnosa")
+        or asuhan.get("nama")
+        or ""
+    )
+    nama = str(nama)
+    for sep in (" b.d", " d.d"):
+        nama = nama.split(sep)[0]
+    return nama.strip() or SDKI_NAME_MAPPING.get(kode, kode)
+
+
+def _luaran_kanonik(asuhan: dict, kode: str) -> str:
+    """Luaran (SLKI) dari item mesin dulu; peta lama hanya cadangan."""
+    luaran = str(asuhan.get("luaran_keperawatan", "")).strip()
+    if luaran:
+        return luaran
+    info = DX_TO_SLKI_MAPPING.get(kode) or {}
+    return info.get("narasi", "")
+
+
 def formulasikan_asuhan(s_input: str, o_input: str) -> tuple[list[dict], str, Dict]:
 
     hasil_cdss = call_cdss_api(s_input, o_input, use_api=False)
@@ -3100,25 +3131,21 @@ def generate_cppt_and_logbook(daftar_asuhan: list[dict], subjektif: str, objekti
     cppt += "A (Assessment / Diagnosa Keperawatan):\n"
     for idx, asuhan in enumerate(daftar_asuhan, 1):
         kode_dx  = asuhan.get("kode_diagnosa", "ERR").strip()
-        nama_dx  = (
-            asuhan.get("nama_diagnosa")
-            or asuhan.get("diagnosa")
-            or asuhan.get("nama")
-            or ""
-        )
-        nama_dx = str(nama_dx).strip()
-        for sep in [" b.d", " d.d"]:
-            if sep in nama_dx:
-                nama_dx = nama_dx.split(sep)[0]
-        nama_dx = nama_dx.strip() or SDKI_NAME_MAPPING.get(kode_dx, "Diagnosa Tidak Diketahui")
+        nama_dx = _nama_kanonik(asuhan, kode_dx)
 
         status_rekomendasi = " | Terkini -> Belum ada entri skor perkembangan terbaru."
-        mapping_info = DX_TO_SLKI_MAPPING.get(kode_dx)
-        if latest_slki and mapping_info:
+        # Luaran (SLKI) & kode luaran dari item mesin (master) dulu; peta lama cadangan.
+        luaran_kanonik = _luaran_kanonik(asuhan, kode_dx)
+        kode_luaran = ""
+        if "(L." in luaran_kanonik:
+            kode_luaran = luaran_kanonik.split("(", 1)[1].split(")")[0].strip()
+        if not kode_luaran:
+            kode_luaran = (DX_TO_SLKI_MAPPING.get(kode_dx) or {}).get("kode_luaran", "")
+        if latest_slki and kode_luaran:
             for slki_nama, skor in latest_slki:
-                if mapping_info["kode_luaran"] in slki_nama:
+                if kode_luaran in slki_nama:
                     status_rekomendasi = (
-                        f" | Terkini -> {mapping_info['narasi']} [Skor Akhir: {skor}/5]"
+                        f" | Terkini -> {luaran_kanonik} [Skor Akhir: {skor}/5]"
                     )
                     break
 
@@ -3134,16 +3161,7 @@ def generate_cppt_and_logbook(daftar_asuhan: list[dict], subjektif: str, objekti
 
     for asuhan in daftar_asuhan:
         kode = asuhan.get("kode_diagnosa", "N/A").strip()
-        nama_diag = (
-            asuhan.get("nama_diagnosa")
-            or asuhan.get("diagnosa")
-            or asuhan.get("nama")
-            or ""
-        )
-        nama_diag = str(nama_diag)
-        for sep in [" b.d", " d.d"]:
-            nama_diag = nama_diag.split(sep)[0]
-        nama_diag = nama_diag.strip() or SDKI_NAME_MAPPING.get(kode, "Diagnosa Keperawatan")
+        nama_diag = _nama_kanonik(asuhan, kode)
 
         intervensi_raw = asuhan.get("rencana_intervensi", asuhan.get("intervensi", {}))
         tindakan_dipilih = []
@@ -4274,7 +4292,7 @@ def main_app() -> None:
 
         for asuhan in st.session_state.daftar_asuhan:
             kode       = asuhan.get("kode_diagnosa", "ERR")
-            short_name = SDKI_NAME_MAPPING.get(kode, kode)
+            short_name = _nama_kanonik(asuhan, kode)
             is_sel     = kode in st.session_state.selected_dx_codes
             new_val    = st.checkbox(
                 f"**{kode}** — {short_name}",
@@ -4329,11 +4347,8 @@ def main_app() -> None:
                     new_daftar_dx = []
                     for idx, asuhan in enumerate(sorted_diagnosa, 1):
                         kode_dx    = asuhan.get("kode_diagnosa", "ERR")
-                        short_name = SDKI_NAME_MAPPING.get(kode_dx, "Diagnosa Tidak Diketahui")
-                        slki_info  = DX_TO_SLKI_MAPPING.get(kode_dx, {})
-                        luaran     = slki_info.get(
-                            "narasi", asuhan.get("luaran_keperawatan", "")
-                        )
+                        short_name = _nama_kanonik(asuhan, kode_dx)
+                        luaran     = _luaran_kanonik(asuhan, kode_dx)
                         new_daftar_dx.append({
                             "id":     idx,
                             "nama":   f"{short_name} ({kode_dx})",
