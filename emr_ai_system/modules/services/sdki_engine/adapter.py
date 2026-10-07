@@ -12,10 +12,18 @@ bukan lagi tabel keyword tertanam di dashboard yang kodenya sempat keliru.
 """
 from __future__ import annotations
 
+import logging
+import math
 import threading
 from typing import Any, Dict, List
 
 from .repository import SdkiRepository
+# Pencocok kriteria milik mesin itu sendiri, dipakai ulang HANYA untuk menandai
+# kriteria mana yang terpenuhi (tampilan) -- supaya tanda ✓ selalu sama dengan
+# pencocokan yang masuk ke skor, bukan pencocok kedua yang bisa berbeda.
+from .repository import _ekstrak_vital, _nilai_kelompok, _tokenize
+
+_log = logging.getLogger(__name__)
 
 _REPO: SdkiRepository | None = None
 _LOCK = threading.Lock()
@@ -46,6 +54,40 @@ def _prioritas(skor: float) -> str:
     return "LOW"
 
 
+_KELOMPOK_KRITERIA = ("mayor", "minor", "faktor_risiko")
+
+
+def _cek_kriteria(repo: SdkiRepository, teks: str,
+                  entry: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Tandai tiap kriteria SDKI (mayor / minor / faktor risiko): terpenuhi oleh
+    data S/O atau belum.
+
+    Memakai `_nilai_kelompok` milik mesin per kriteria, sehingga hasilnya
+    identik dengan pencocokan yang dihitung ke skor (termasuk penjaga arah
+    vital & anti-negasi). Murni tampilan: skor dan urutan tidak berubah.
+    Kembar dengan `DiagnosisService.cek_kriteria()` di aplikasi asuhan.
+    """
+    kriteria = entry.get("kriteria") or {}
+    hasil = {
+        kunci: [{"teks": str(k), "cocok": False} for k in (kriteria.get(kunci) or [])]
+        for kunci in _KELOMPOK_KRITERIA
+    }
+    try:
+        tokens = _tokenize(teks)
+        if tokens:
+            vital = _ekstrak_vital(teks)
+            bobot = repo._bobot_kata()
+            bawaan = math.log(1 + len(repo._entries()))
+            for daftar in hasil.values():
+                for k in daftar:
+                    k["cocok"] = _nilai_kelompok(
+                        [k["teks"]], tokens, vital, bobot, bawaan)[3] > 0
+    except Exception:  # tampilan saja -- jangan gagalkan CDSS
+        _log.warning("Gagal menandai kriteria SDKI", exc_info=True)
+    return hasil
+
+
 def _rencana_intervensi(intervensi: Dict[str, list]) -> Dict[str, str]:
     """{observasi/terapeutik/edukasi/kolaborasi:[...]} -> dict 4 kolom (string)."""
     out: Dict[str, str] = {}
@@ -60,7 +102,11 @@ def analyze_clinical_trends_improved(s_input: str, o_input: str) -> Dict[str, An
     Drop-in pengganti fungsi CDSS 2.0. Menerima Subjektif & Objektif,
     mengembalikan dict: status, analisis (ringkasan konteks), clinical_context,
     numeric_findings, recommendations[ {code, name, score, priority, luaran,
-    kode_diagnosa, diagnosa_keperawatan, luaran_keperawatan, rencana_intervensi} ].
+    kode_diagnosa, diagnosa_keperawatan, luaran_keperawatan, rencana_intervensi,
+    jenis, mayor_cocok, mayor_total, kriteria_cek} ].
+
+    `kriteria_cek` = kriteria mayor/minor/faktor risiko dari master, masing-
+    masing ditandai terpenuhi/belum oleh S/O (untuk tampilan ranking CDSS).
     """
     repo = get_repository()
     s_input = (s_input or "").strip()
@@ -83,6 +129,7 @@ def analyze_clinical_trends_improved(s_input: str, o_input: str) -> Dict[str, An
         intervensi = repo.get_intervensi(kode) or {}
         luaran_str = (f"{luaran.get('nama', '')} ({luaran.get('kode', '')})".strip()
                       if luaran.get("nama") else "")
+        entry = u.get("diagnosis") or repo.find(kode) or {}
         recs.append({
             "code": kode,
             "name": u.get("nama", ""),
@@ -93,6 +140,10 @@ def analyze_clinical_trends_improved(s_input: str, o_input: str) -> Dict[str, An
             "cardiac_context_boost": u.get("konteks_boost", 0),
             "dari_konteks": bool(u.get("dari_konteks")),
             "alasan": u.get("kata_cocok", []),
+            "jenis": entry.get("jenis", ""),
+            "mayor_cocok": int(u.get("mayor_cocok") or 0),
+            "mayor_total": int(u.get("mayor_total") or 0),
+            "kriteria_cek": _cek_kriteria(repo, teks, entry),
             "luaran": {"kode": luaran.get("kode", ""), "nama": luaran.get("nama", "")},
             # Field yang dulu diisi bridge_engine dari tabel lokal kode-lama;
             # kini dari master JSON (satu sumber kebenaran):

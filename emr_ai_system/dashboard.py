@@ -20,6 +20,12 @@ from pathlib import Path
 # analyze_clinical_trends_improved() CDSS 2.0, tapi data (kode, luaran,
 # intervensi) berasal dari SATU sumber master JSON yang kodenya sudah benar.
 from modules.services.sdki_engine import analyze_clinical_trends_improved
+# Tampilan skor + kriteria SDKI (berkas identik dengan aplikasi asuhan).
+# Bila berkasnya tidak ada, ranking CDSS kembali ke tampilan satu baris lama.
+try:
+    from components import kriteria_sdki as _kriteria_sdki
+except ImportError:
+    _kriteria_sdki = None
 try:
     from modules.services.cdss_dokter import analyze_icd10_dan_tatalaksana as _cdss_dokter_analyze
     CDSS_DOKTER_AVAILABLE = True
@@ -4273,8 +4279,19 @@ def main_app() -> None:
                              f"{sumber_aktif or 'tidak diketahui'}):**"
                     )
                     st.markdown(label_ranking)
-                    for r in recs[:8]:
-                        st.write(f"- `[{r['priority']}]` **{r['code']}** — {r['name']} (skor: {r['score']})")
+                    if _kriteria_sdki is not None:
+                        # Tiap baris bisa diklik untuk membuka kriteria SDKI
+                        # (mayor/minor/faktor risiko), ✓ = terpenuhi oleh S/O.
+                        st.caption(
+                            "Klik diagnosa untuk melihat kriteria mayor/minor/faktor "
+                            "risiko SDKI. " + _kriteria_sdki.KETERANGAN
+                        )
+                        for r in recs[:8]:
+                            st.markdown(_kriteria_sdki.html_item_ranking(r),
+                                        unsafe_allow_html=True)
+                    else:
+                        for r in recs[:8]:
+                            st.write(f"- `[{r['priority']}]` **{r['code']}** — {r['name']} (skor: {r['score']})")
                 else:
                     st.caption("Tidak ada diagnosa yang melewati ambang skor v2.0 untuk input ini.")
 
